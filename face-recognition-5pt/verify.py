@@ -48,6 +48,7 @@ def verify_project():
         "src/enroll.py",
         "src/evaluate.py",
         "src/recognize.py",
+        "src/lock.py",
     ]
     
     for f in required_files:

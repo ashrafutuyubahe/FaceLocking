@@ -131,6 +131,21 @@ FONT_COLOR_REJECT = (0, 0, 255)  # Red (BGR)
 FONT_COLOR_TEXT = (255, 255, 255)  # White (BGR)
 
 # ============================================================================
+# FACE LOCKING (Term-02 Week-04)
+# ============================================================================
+
+LOCK_RELEASE_FRAMES = 45
+LOCK_MOVEMENT_THRESHOLD_PX = 25
+LOCK_EAR_BLINK_THRESHOLD = 0.22
+LOCK_SMILE_MOUTH_RATIO = 1.18
+LOCK_ACTION_COOLDOWN_FRAMES = 10
+HISTORY_DIR = DATA_DIR / "history"
+LOCK_EAR_LEFT_INDICES = (33, 160, 158, 133, 153, 144)
+LOCK_EAR_RIGHT_INDICES = (362, 385, 387, 263, 373, 380)
+LOCK_MOUTH_LEFT_INDEX = 61
+LOCK_MOUTH_RIGHT_INDEX = 291
+
+# ============================================================================
 # DEBUG & LOGGING
 # ============================================================================
 
@@ -157,6 +172,7 @@ def ensure_dirs() -> None:
     ENROLL_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":
