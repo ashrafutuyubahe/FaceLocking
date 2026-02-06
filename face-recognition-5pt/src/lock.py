@@ -242,16 +242,33 @@ def main():
 
         matched_face = None
         best_dist = 1.0
-
+        
+        # Process all faces and identify them
+        face_identities = []  # (face, identity_name, distance, is_locked_target)
+        
         for face in faces:
             aligned, _ = aligner.align(frame, face.landmarks)
             emb, _ = embedder.embed(aligned)
-            d = cosine_distance(emb, embeddings[lock_idx])
+            
+            # Find best match across all enrolled identities
+            distances = [cosine_distance(emb, embeddings[i]) for i in range(len(embeddings))]
+            min_dist_idx = np.argmin(distances)
+            min_dist = distances[min_dist_idx]
+            
+            if min_dist <= threshold:
+                identity = names[min_dist_idx]
+                face_identities.append((face, identity, min_dist, identity == lock_identity))
+                
+                # Track if this is the locked identity
+                if identity == lock_identity and min_dist < best_dist:
+                    best_dist = min_dist
+                    matched_face = face
+            else:
+                # Unknown face
+                face_identities.append((face, "UNKNOWN", min_dist, False))
 
-            if d < best_dist:
-                best_dist = d
-                matched_face = face
-
+        # Handle locked state and track actions
+        tracked_box = None
         if matched_face and best_dist <= threshold:
             fail_count = 0
             if not locked:
@@ -260,7 +277,8 @@ def main():
                 action_detector.reset()
                 print("🔒 LOCKED")
 
-            x1, y1, x2, y2 = face_tracker.update(
+            # Track and detect actions only for locked face
+            tracked_box = face_tracker.update(
                 matched_face.x1,
                 matched_face.y1,
                 matched_face.x2,
@@ -275,23 +293,56 @@ def main():
                     res.multi_face_landmarks[0].landmark,
                     matched_face, frame_idx, W, H
                 )
-
-            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            cv2.putText(
-                vis, f"🔒 {lock_identity}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 255, 0), 2
-            )
-
-            action_detector.draw_actions(vis, x1, y1)
-
         else:
             fail_count += 1
             if fail_count >= config.LOCK_RELEASE_FRAMES:
                 if locked:
                     print("🔓 UNLOCKED")
                 locked = False
+
+        # Draw all faces with appropriate labels
+        for face, identity, dist, is_target in face_identities:
+            if is_target and locked:
+                # Locked target: green box with tracker smoothing and actions
+                x1, y1, x2, y2 = tracked_box
+                color = (0, 255, 0)
+                label = f"🔒 {identity}"
+                thickness = 3
+                
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
+                cv2.putText(
+                    vis, label,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    color, 2
+                )
+                
+                # Draw actions only for locked target
+                action_detector.draw_actions(vis, x1, y1)
+                
+            elif identity == "UNKNOWN":
+                # Unknown face: red box
+                x1, y1, x2, y2 = face.x1, face.y1, face.x2, face.y2
+                color = (0, 0, 255)
+                label = "UNKNOWN"
+                thickness = 2
+                
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
+                cv2.putText(
+                    vis, label,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    color, 2
+                )
+            else:
+                # Other known identity: just show name, no box
+                x1, y1, x2, y2 = face.x1, face.y1, face.x2, face.y2
+                cv2.putText(
+                    vis, identity,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 165, 0), 2  # Orange text
+                )
 
         cv2.imshow("Face Locking", vis)
         if cv2.waitKey(1) & 0xFF == ord("q"):
