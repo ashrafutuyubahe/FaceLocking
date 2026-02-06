@@ -1,11 +1,12 @@
 {
-  "timestamp": "2026-02-06 06:52:08",
+  "timestamp": "2026-02-06 07:11:31",
   "embedding_dim": 512,
   "names": [
     "ashrafu",
+    "bonheur",
     "hackim",
     "hackim2",
     "me"
   ],
-  "samples_used": 32
+  "samples_used": 35
 }

@@ -28,134 +28,137 @@ from .align import FaceAligner
 from .embed import ArcFaceEmbedder
 
 
+# ============================================================
+# Face Tracker (smooth bounding box)
+# ============================================================
 class FaceTracker:
-    """
-    Smooths face tracking with temporal filtering.
-    Prevents jittery bounding box movements.
-    """
     def __init__(self, buffer_size=5):
-        self.buffer_size = buffer_size
-        self.x1_buffer = deque(maxlen=buffer_size)
-        self.y1_buffer = deque(maxlen=buffer_size)
-        self.x2_buffer = deque(maxlen=buffer_size)
-        self.y2_buffer = deque(maxlen=buffer_size)
-    
+        self.buf = deque(maxlen=buffer_size)
+
     def update(self, x1, y1, x2, y2):
-        """Add new bounding box and return smoothed version."""
-        self.x1_buffer.append(float(x1))
-        self.y1_buffer.append(float(y1))
-        self.x2_buffer.append(float(x2))
-        self.y2_buffer.append(float(y2))
-        
-        smooth_x1 = int(np.mean(self.x1_buffer))
-        smooth_y1 = int(np.mean(self.y1_buffer))
-        smooth_x2 = int(np.mean(self.x2_buffer))
-        smooth_y2 = int(np.mean(self.y2_buffer))
-        
-        return smooth_x1, smooth_y1, smooth_x2, smooth_y2
-    
+        self.buf.append(np.array([x1, y1, x2, y2], dtype=np.float32))
+        avg = np.mean(self.buf, axis=0)
+        return avg.astype(int)
+
     def reset(self):
-        """Reset buffers (for new lock)."""
-        self.x1_buffer.clear()
-        self.y1_buffer.clear()
-        self.x2_buffer.clear()
-        self.y2_buffer.clear()
+        self.buf.clear()
 
 
+# ============================================================
+# Action Detector (movement / blink / smile)
+# ============================================================
 class ActionDetector:
-    """
-    Robust action detection with state machine approach.
-    Detects: face_moved_left, face_moved_right, eye_blink, smile.
-    """
     def __init__(self):
-        self.last_action_frame = {}
         self.prev_center_x = None
-        self.baseline_mouth_width = None
-        self.mouth_width_samples = deque(maxlen=30)
-        self.ear_samples = deque(maxlen=10)
-        self.blink_state = False  # Track if currently in blink
-        self.smile_state = False  # Track if currently smiling
-    
-    def detect(self, frame, matched_face, frame_idx, W, H):
-        """Detect actions and return list of (action_type, description) tuples."""
+        self.center_hist = deque(maxlen=8)
+
+        self.ear_hist = deque(maxlen=8)
+        self.mouth_hist = deque(maxlen=20)
+
+        self.last_action = {}
+        self.blink_state = False
+        self.smile_state = False
+
+        self.visual_actions = deque(maxlen=5)  # (text, expiry_time)
+
+    def _cooldown(self, key, frame_idx):
+        last = self.last_action.get(key, -999)
+        if frame_idx - last >= config.LOCK_ACTION_COOLDOWN_FRAMES:
+            self.last_action[key] = frame_idx
+            return True
+        return False
+
+    def detect(self, landmarks, face, frame_idx, W, H):
         actions = []
-        cooldown = config.LOCK_ACTION_COOLDOWN_FRAMES
-        
-        center_x = (matched_face.x1 + matched_face.x2) / 2.0
-        
-        # Movement detection (left/right)
-        if self.prev_center_x is not None:
-            dx = center_x - self.prev_center_x
+
+        # ---------------- Movement ----------------
+        cx = (face.x1 + face.x2) / 2
+        self.center_hist.append(cx)
+
+        if len(self.center_hist) >= 6:
+            dx = self.center_hist[-1] - self.center_hist[0]
+
             if dx <= -config.LOCK_MOVEMENT_THRESHOLD_PX:
-                if frame_idx - self.last_action_frame.get("face_moved_left", -999) >= cooldown:
-                    actions.append(("face_moved_left", "↶ moved left"))
-                    self.last_action_frame["face_moved_left"] = frame_idx
+                if self._cooldown("left", frame_idx):
+                    actions.append(("face_moved_left", "⬅ LEFT"))
             elif dx >= config.LOCK_MOVEMENT_THRESHOLD_PX:
-                if frame_idx - self.last_action_frame.get("face_moved_right", -999) >= cooldown:
-                    actions.append(("face_moved_right", "↷ moved right"))
-                    self.last_action_frame["face_moved_right"] = frame_idx
-        
-        # Get full landmarks for eye and mouth detection
-        landmarks_list = _get_full_landmarks(frame)
-        if landmarks_list is not None:
-            # Eye blink detection
-            ear_left = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_LEFT_INDICES, W, H)
-            ear_right = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_RIGHT_INDICES, W, H)
-            ear = (ear_left + ear_right) / 2.0
-            
-            self.ear_samples.append(ear)
-            ear_avg = np.mean(list(self.ear_samples)) if self.ear_samples else ear
-            
-            # State machine for blink detection
-            is_blinking = ear < config.LOCK_EAR_BLINK_THRESHOLD * 0.95
-            if is_blinking and not self.blink_state:
-                if frame_idx - self.last_action_frame.get("eye_blink", -999) >= cooldown:
-                    actions.append(("eye_blink", "👁️ blinked"))
-                    self.last_action_frame["eye_blink"] = frame_idx
-                self.blink_state = True
-            elif not is_blinking:
-                self.blink_state = False
-            
-            # Smile detection
-            mouth_width = _mouth_width_from_landmarks(
-                landmarks_list, config.LOCK_MOUTH_LEFT_INDEX,
-                config.LOCK_MOUTH_RIGHT_INDEX, W, H
-            )
-            self.mouth_width_samples.append(mouth_width)
-            
-            if self.baseline_mouth_width is None and len(self.mouth_width_samples) >= 15:
-                self.baseline_mouth_width = float(np.median(self.mouth_width_samples))
-            
-            # State machine for smile detection
-            is_smiling = (
-                self.baseline_mouth_width is not None and
-                self.baseline_mouth_width > 1.0 and
-                mouth_width >= self.baseline_mouth_width * config.LOCK_SMILE_MOUTH_RATIO
-            )
-            if is_smiling and not self.smile_state:
-                if frame_idx - self.last_action_frame.get("smile", -999) >= cooldown:
-                    actions.append(("smile", "😊 smiled"))
-                    self.last_action_frame["smile"] = frame_idx
+                if self._cooldown("right", frame_idx):
+                    actions.append(("face_moved_right", "➡ RIGHT"))
+
+        # ---------------- Eye blink ----------------
+        ear_l = _ear_from_landmarks(
+            landmarks, config.LOCK_EAR_LEFT_INDICES, W, H
+        )
+        ear_r = _ear_from_landmarks(
+            landmarks, config.LOCK_EAR_RIGHT_INDICES, W, H
+        )
+        ear = (ear_l + ear_r) / 2
+        self.ear_hist.append(ear)
+        ear_avg = np.mean(self.ear_hist)
+
+        blinking = ear_avg < config.LOCK_EAR_BLINK_THRESHOLD
+
+        if blinking and not self.blink_state:
+            if self._cooldown("blink", frame_idx):
+                actions.append(("eye_blink", "👁 BLINK"))
+            self.blink_state = True
+        elif not blinking:
+            self.blink_state = False
+
+        # ---------------- Smile ----------------
+        mouth_w = _mouth_width_from_landmarks(
+            landmarks,
+            config.LOCK_MOUTH_LEFT_INDEX,
+            config.LOCK_MOUTH_RIGHT_INDEX,
+            W, H,
+        )
+        self.mouth_hist.append(mouth_w)
+
+        if len(self.mouth_hist) >= 15:
+            baseline = np.median(self.mouth_hist)
+            smiling = mouth_w >= baseline * config.LOCK_SMILE_MOUTH_RATIO
+
+            if smiling and not self.smile_state:
+                if self._cooldown("smile", frame_idx):
+                    actions.append(("smile", "😊 SMILE"))
                 self.smile_state = True
-            elif not is_smiling:
+            elif not smiling:
                 self.smile_state = False
-        
-        self.prev_center_x = center_x
+
+        # store for overlay
+        now = time.time()
+        for _, txt in actions:
+            self.visual_actions.append((txt, now + 1.2))
+
         return actions
-    
+
+    def draw_actions(self, vis, x, y):
+        now = time.time()
+        dy = 0
+        for txt, expiry in list(self.visual_actions):
+            if now <= expiry:
+                cv2.putText(
+                    vis, txt, (x, y - 20 - dy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2
+                )
+                dy += 22
+
     def reset(self):
-        """Reset state for new lock."""
-        self.last_action_frame.clear()
         self.prev_center_x = None
-        self.baseline_mouth_width = None
-        self.mouth_width_samples.clear()
-        self.ear_samples.clear()
+        self.center_hist.clear()
+        self.ear_hist.clear()
+        self.mouth_hist.clear()
+        self.last_action.clear()
+        self.visual_actions.clear()
         self.blink_state = False
         self.smile_state = False
 
 
+# ============================================================
+# Helpers
+# ============================================================
 def load_database():
-    """Load enrolled face database."""
     if not config.DB_NPZ_PATH.exists():
         return {}
     data = np.load(str(config.DB_NPZ_PATH), allow_pickle=True)
@@ -163,277 +166,139 @@ def load_database():
 
 
 def cosine_distance(a, b):
-    """Compute cosine distance between two vectors (optimized)."""
     a = a.reshape(-1).astype(np.float32)
     b = b.reshape(-1).astype(np.float32)
     return 1.0 - float(np.dot(a, b))
 
 
-def _ear_from_landmarks(landmarks_list, indices, W, H):
-    """Eye Aspect Ratio from 6 landmark indices (vertical/horizontal ratio)."""
-    pts = []
-    for i in indices:
-        lm = landmarks_list[i]
-        pts.append((lm.x * W, lm.y * H))
+def _ear_from_landmarks(lms, idxs, W, H):
+    pts = [(lms[i].x * W, lms[i].y * H) for i in idxs]
     p1, p2, p3, p4, p5, p6 = [np.array(p) for p in pts]
-    v1 = np.linalg.norm(p2 - p6)
-    v2 = np.linalg.norm(p3 - p5)
-    h = np.linalg.norm(p1 - p4)
-    if h < 1e-6:
-        return 0.5
-    return (v1 + v2) / (2.0 * h)
+    return (
+        np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5)
+    ) / (2 * np.linalg.norm(p1 - p4) + 1e-6)
 
 
-def _mouth_width_from_landmarks(landmarks_list, left_idx, right_idx, W, H):
-    """Mouth width in pixels."""
-    l = landmarks_list[left_idx]
-    r = landmarks_list[right_idx]
+def _mouth_width_from_landmarks(lms, li, ri, W, H):
+    l, r = lms[li], lms[ri]
     return np.hypot((r.x - l.x) * W, (r.y - l.y) * H)
 
 
-def _get_full_landmarks(frame):
-    """Run MediaPipe Face Mesh on frame; return first face landmark list or None."""
-    if mp is None:
-        return None
-    H, W = frame.shape[:2]
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    db = load_database()
+    if not db:
+        print("No enrolled identities.")
+        return
+
+    names = sorted(db.keys())
+    print("Enrolled:", names)
+    lock_identity = input("Lock identity: ").strip()
+    if lock_identity not in db:
+        print("Invalid identity.")
+        return
+
+    lock_idx = names.index(lock_identity)
+    embeddings = np.stack([db[n] for n in names])
+
+    detector = HaarMediaPipeFaceDetector(min_size=config.HAAR_MIN_SIZE)
+    aligner = FaceAligner()
+    embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
+
+    face_tracker = FaceTracker()
+    action_detector = ActionDetector()
+
+    cap = cv2.VideoCapture(config.CAMERA_INDEX)
+    if not cap.isOpened():
+        print("Camera error")
+        return
+
+    mp_mesh = mp.solutions.face_mesh.FaceMesh(
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-    results = mesh.process(rgb)
-    mesh.close()
-    if not results.multi_face_landmarks:
-        return None
-    return results.multi_face_landmarks[0].landmark
-
-
-def main():
-    """Face Locking: select one identity, lock onto that face, track and record actions."""
-    db = load_database()
-    if not db:
-        print("ERROR: No enrolled identities. Run: python -m src.enroll")
-        return False
-
-    names = sorted(db.keys())
-    print("\nEnrolled identities:")
-    for i, n in enumerate(names, 1):
-        print(f"  {i}. {n}")
-    print("\nEnter the name of the identity to lock (exact match): ", end="")
-    try:
-        choice = input().strip()
-    except EOFError:
-        choice = names[0] if names else ""
-    if not choice:
-        choice = names[0] if names else ""
-    if choice not in db:
-        print(f"ERROR: '{choice}' not in database. Choose from: {names}")
-        return False
-    lock_identity = choice
-    print("Will lock onto:", lock_identity)
-
-    config.ensure_dirs()
-    config.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-
-    detector = HaarMediaPipeFaceDetector(min_size=config.HAAR_MIN_SIZE)
-    aligner = FaceAligner()
-    embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
-    embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0)
-    lock_idx = names.index(lock_identity)
-    threshold = config.DEFAULT_DISTANCE_THRESHOLD
-
-    # Initialize new components
-    face_tracker = FaceTracker(buffer_size=5)
-    action_detector = ActionDetector()
-
-    cap = cv2.VideoCapture(config.CAMERA_INDEX)
-    if not cap.isOpened():
-        print("ERROR: Cannot open camera.")
-        return False
 
     locked = False
     fail_count = 0
-    history_file = None
-    history_path = None
     frame_idx = 0
-    process_frame_interval = 2  # Process every 2nd frame for performance
+    threshold = config.DEFAULT_DISTANCE_THRESHOLD
 
-    print("\nFace Locking - When the selected face appears, system will lock. q=Quit")
-    print("Controls: q=quit, +/-=threshold, r=reload")
+    print("🔍 Searching...")
 
-    t0 = time.time()
-    frame_count = 0
-    fps = 0.0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
-            elapsed = time.time() - t0
-            if elapsed >= 1.0:
-                fps = frame_count / elapsed
-                frame_count = 0
-                t0 = time.time()
-            frame_count += 1
+        vis = frame.copy()
+        H, W = frame.shape[:2]
 
-            vis = frame.copy()
-            H, W = frame.shape[:2]
-            matched_face = None  # Initialize for use in all paths
-            best_dist = 1.0
-            
-            # Performance: Skip detection on some frames when unlocked
-            should_detect = (frame_idx % process_frame_interval == 0) or not locked
-            faces = detector.detect(frame) if should_detect else []
+        faces = detector.detect(frame)
 
+        matched_face = None
+        best_dist = 1.0
+
+        for face in faces:
+            aligned, _ = aligner.align(frame, face.landmarks)
+            emb, _ = embedder.embed(aligned)
+            d = cosine_distance(emb, embeddings[lock_idx])
+
+            if d < best_dist:
+                best_dist = d
+                matched_face = face
+
+        if matched_face and best_dist <= threshold:
+            fail_count = 0
             if not locked:
-                # Search for target identity
-                for face in faces:
-                    aligned, _ = aligner.align(frame, face.landmarks)
-                    query_emb, _ = embedder.embed(aligned)
-                    dists = np.array([cosine_distance(query_emb, embeddings_matrix[i]) for i in range(len(names))])
-                    best_idx = int(np.argmin(dists))
-                    best_dist = dists[best_idx]
-                    
-                    # Lock acquired!
-                    if best_idx == lock_idx and best_dist <= threshold:
-                        locked = True
-                        fail_count = 0
-                        face_tracker.reset()
-                        action_detector.reset()
-                        
-                        # Create history file
-                        ts = time.strftime("%Y%m%d%H%M%S", time.localtime())
-                        safe_name = lock_identity.replace(" ", "_").lower()
-                        history_path = config.HISTORY_DIR / (safe_name + "_history_" + ts + ".txt")
-                        history_file = open(history_path, "w", encoding="utf-8")
-                        history_file.write("# Face Lock history: " + lock_identity + "\n")
-                        history_file.write("# Started: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) + "\n")
-                        history_file.write("# Format: timestamp  action_type  description\n# ---\n")
-                        history_file.flush()
-                        print(f"🔒 LOCKED onto {lock_identity} | Recording to {history_path.name}")
-                        break
+                locked = True
+                face_tracker.reset()
+                action_detector.reset()
+                print("🔒 LOCKED")
 
-            else:
-                # Track locked identity
-                matched_face = None
-                best_dist = 1.0
-                
-                for face in faces:
-                    aligned, _ = aligner.align(frame, face.landmarks)
-                    query_emb, _ = embedder.embed(aligned)
-                    dists = np.array([cosine_distance(query_emb, embeddings_matrix[i]) for i in range(len(names))])
-                    idx = int(np.argmin(dists))
-                    d = dists[idx]
-                    
-                    # Match found!
-                    if idx == lock_idx and d <= threshold:
-                        matched_face = face
-                        best_dist = d
-                        fail_count = 0
-                        break
-                    
-                    # Fallback: single face, close to threshold
-                    if len(faces) == 1 and d < 0.5:
-                        matched_face = face
-                        best_dist = d
-                        fail_count += 1
-                        if fail_count > 5:
-                            matched_face = None
-                        break
+            x1, y1, x2, y2 = face_tracker.update(
+                matched_face.x1,
+                matched_face.y1,
+                matched_face.x2,
+                matched_face.y2,
+            )
 
-                if matched_face is None:
-                    fail_count += 1
-                    if fail_count >= config.LOCK_RELEASE_FRAMES:
-                        locked = False
-                        if history_file:
-                            history_file.close()
-                            history_file = None
-                        print(f"🔓 Lock released (no face for {config.LOCK_RELEASE_FRAMES} frames)")
-                else:
-                    # Smooth face tracking
-                    smooth_x1, smooth_y1, smooth_x2, smooth_y2 = face_tracker.update(
-                        matched_face.x1, matched_face.y1, matched_face.x2, matched_face.y2
-                    )
-                    
-                    # Detect actions with new detector
-                    action_list = action_detector.detect(frame, matched_face, frame_idx, W, H)
-                    
-                    # Record actions to file
-                    ts = time.time()
-                    for action_type, desc in action_list:
-                        line = "%.2f  %s  %s\n" % (ts, action_type, desc)
-                        if history_file:
-                            history_file.write(line)
-                            history_file.flush()
-                        print(f"  Action: {desc}")
-                    
-                    # Store smoothed position for next draw
-                    matched_face.x1 = smooth_x1
-                    matched_face.y1 = smooth_y1
-                    matched_face.x2 = smooth_x2
-                    matched_face.y2 = smooth_y2
-                    
-                    # Draw locked face with enhanced visuals
-                    cv2.rectangle(vis, (matched_face.x1, matched_face.y1), (matched_face.x2, matched_face.y2), (0, 255, 0), 4)
-                    cv2.putText(vis, f"🔒 {lock_identity}", (matched_face.x1, max(0, matched_face.y1 - 15)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    cv2.putText(vis, f"dist={best_dist:.3f}", (matched_face.x1, matched_face.y2 + 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = mp_mesh.process(rgb)
 
-            # Draw other detected faces (not the lock target)
-            if locked and matched_face is not None:
-                for face in faces:
-                    # Skip the locked face
-                    if face.x1 == matched_face.x1 and face.y1 == matched_face.y1:
-                        continue
-                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 0, 255), 2)
-                    cv2.putText(vis, "Other", (face.x1, face.y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
-            elif not locked:
-                # Show searching status
-                for face in faces:
-                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 255, 0), 2)
-                    cv2.putText(vis, "Searching...", (face.x1, face.y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            if res.multi_face_landmarks:
+                actions = action_detector.detect(
+                    res.multi_face_landmarks[0].landmark,
+                    matched_face, frame_idx, W, H
+                )
 
-            # Enhanced header
-            status = "🔒 LOCKED" if locked else "🔍 Searching..."
-            header = f"Target: {lock_identity} | {status} | FPS: {fps:.1f}"
-            cv2.putText(vis, header, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Instructions
-            cv2.putText(vis, "q=quit | +/-=threshold | r=reload", (10, vis.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            
-            cv2.imshow("Face Locking", vis)
-            
-            # Handle keyboard input
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key in (ord("+"), ord("=")):
-                threshold = min(1.0, threshold + 0.01)
-                print(f"Threshold increased to {threshold:.2f}")
-            elif key == ord("-"):
-                threshold = max(0.0, threshold - 0.01)
-                print(f"Threshold decreased to {threshold:.2f}")
-            elif key == ord("r"):
-                db = load_database()
-                names = sorted(db.keys())
-                embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0)
-                print(f"Reloaded {len(db)} identities from database")
-    
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        if history_file:
-            history_file.close()
-        if history_path:
-            print(f"✓ History saved to: {history_path}")
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(
+                vis, f"🔒 {lock_identity}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 255, 0), 2
+            )
 
+            action_detector.draw_actions(vis, x1, y1)
+
+        else:
+            fail_count += 1
+            if fail_count >= config.LOCK_RELEASE_FRAMES:
+                if locked:
+                    print("🔓 UNLOCKED")
+                locked = False
+
+        cv2.imshow("Face Locking", vis)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
