@@ -12,7 +12,7 @@ def main():
     Open webcam and display live video with FPS counter.
     Press 'q' to exit.
     """
-    camera_index = 0
+    camera_index = 2
     cap = cv2.VideoCapture(camera_index)
     
     if not cap.isOpened():

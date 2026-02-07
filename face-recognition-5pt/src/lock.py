@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from collections import deque
+from datetime import datetime
 import cv2
 import numpy as np
 
@@ -26,6 +27,61 @@ from . import config
 from .haar_5pt import HaarMediaPipeFaceDetector, FaceDetection
 from .align import FaceAligner
 from .embed import ArcFaceEmbedder
+
+
+# ============================================================
+# History Logger (save actions to file)
+# ============================================================
+class HistoryLogger:
+    def __init__(self, identity_name, history_dir=None):
+        """Initialize history logger for a specific identity."""
+        self.identity_name = identity_name
+        
+        if history_dir is None:
+            history_dir = config.HISTORY_DIR
+        self.history_dir = Path(history_dir)
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"{identity_name}_history_{timestamp}.txt"
+        self.history_file = self.history_dir / filename
+        
+        # Create history file with header
+        self._create_header()
+        print(f"📝 History logging to: {self.history_file}")
+    
+    def _create_header(self):
+        """Create history file with header information."""
+        with open(self.history_file, 'w', encoding='utf-8') as f:
+            f.write(f"# Face Lock history: {self.identity_name}\n")
+            f.write(f"# Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("# Format: timestamp  action_type  description\n")
+            f.write("# ---\n")
+            f.write("\n")
+    
+    def log_action(self, action_type, description=""):
+        """Log an action to the history file."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_line = f"{timestamp}  {action_type:20s}  {description}\n"
+        
+        try:
+            with open(self.history_file, 'a', encoding='utf-8') as f:
+                f.write(log_line)
+        except Exception as e:
+            print(f"⚠ Failed to write to history: {e}")
+    
+    def log_lock_start(self):
+        """Log when locking starts."""
+        self.log_action("LOCK_START", f"Locked onto {self.identity_name}")
+    
+    def log_lock_release(self):
+        """Log when lock is released."""
+        self.log_action("LOCK_RELEASE", f"Released lock on {self.identity_name}")
+    
+    def log_multi_person(self, identities_list):
+        """Log when multiple people are detected."""
+        identities_str = ", ".join(identities_list)
+        self.log_action("MULTI_PERSON", f"Multiple people: {identities_str}")
 
 
 # ============================================================
@@ -75,9 +131,10 @@ class ActionDetector:
         cx = (face.x1 + face.x2) / 2
         self.center_hist.append(cx)
 
-        if len(self.center_hist) >= 6:
+        if len(self.center_hist) >= 4:  # Reduced for more responsive detection
             dx = self.center_hist[-1] - self.center_hist[0]
 
+            # Log movement continuously while moving (with cooldown)
             if dx <= -config.LOCK_MOVEMENT_THRESHOLD_PX:
                 if self._cooldown("left", frame_idx):
                     actions.append(("face_moved_left", "⬅ LEFT"))
@@ -98,11 +155,18 @@ class ActionDetector:
 
         blinking = ear_avg < config.LOCK_EAR_BLINK_THRESHOLD
 
-        if blinking and not self.blink_state:
-            if self._cooldown("blink", frame_idx):
-                actions.append(("eye_blink", "👁 BLINK"))
-            self.blink_state = True
-        elif not blinking:
+        # Log blink continuously while blinking (with cooldown)
+        if blinking:
+            if not self.blink_state:
+                # First blink detection
+                if self._cooldown("blink", frame_idx):
+                    actions.append(("eye_blink", "👁 BLINK"))
+                self.blink_state = True
+            else:
+                # Continue logging while still blinking (with cooldown)
+                if self._cooldown("blink", frame_idx):
+                    actions.append(("eye_blink", "👁 BLINK"))
+        else:
             self.blink_state = False
 
         # ---------------- Smile ----------------
@@ -118,11 +182,18 @@ class ActionDetector:
             baseline = np.median(self.mouth_hist)
             smiling = mouth_w >= baseline * config.LOCK_SMILE_MOUTH_RATIO
 
-            if smiling and not self.smile_state:
-                if self._cooldown("smile", frame_idx):
-                    actions.append(("smile", "😊 SMILE"))
-                self.smile_state = True
-            elif not smiling:
+            # Log smile continuously while smiling (with cooldown)
+            if smiling:
+                if not self.smile_state:
+                    # First smile detection
+                    if self._cooldown("smile", frame_idx):
+                        actions.append(("smile", "😊 SMILE"))
+                    self.smile_state = True
+                else:
+                    # Continue logging while still smiling (with cooldown)
+                    if self._cooldown("smile", frame_idx):
+                        actions.append(("smile", "😊 SMILE"))
+            else:
                 self.smile_state = False
 
         # store for overlay
@@ -208,15 +279,20 @@ def main():
     embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
 
     face_tracker = FaceTracker()
-    action_detector = ActionDetector()
+    # Multiple action detectors - one for each face identity
+    action_detectors = {}  # {identity_name: ActionDetector}
+    
+    # History logger for the locked identity
+    history_logger = HistoryLogger(lock_identity)
 
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
     if not cap.isOpened():
         print("Camera error")
         return
 
+    # Enable multi-face detection for MediaPipe
     mp_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1,
+        max_num_faces=5,  # Support up to 5 faces simultaneously
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -266,6 +342,14 @@ def main():
             else:
                 # Unknown face
                 face_identities.append((face, "UNKNOWN", min_dist, False))
+        
+        # Log multi-person detection
+        if len(face_identities) > 1:
+            identities_list = [f[1] for f in face_identities]
+            identities_str = ", ".join(identities_list)
+            if frame_idx % 30 == 0:  # Log every 30 frames to avoid spam
+                print(f"👥 Multiple people detected: {identities_str}")
+                history_logger.log_multi_person(identities_list)
 
         # Handle locked state and track actions
         tracked_box = None
@@ -274,39 +358,79 @@ def main():
             if not locked:
                 locked = True
                 face_tracker.reset()
-                action_detector.reset()
-                print("🔒 LOCKED")
+                print(f"🔒 LOCKED onto {lock_identity}")
+                history_logger.log_lock_start()
 
-            # Track and detect actions only for locked face
+            # Track locked face with smoothing
             tracked_box = face_tracker.update(
                 matched_face.x1,
                 matched_face.y1,
                 matched_face.x2,
                 matched_face.y2,
             )
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = mp_mesh.process(rgb)
-
-            if res.multi_face_landmarks:
-                actions = action_detector.detect(
-                    res.multi_face_landmarks[0].landmark,
-                    matched_face, frame_idx, W, H
-                )
+        
+        # Process behaviors for ALL detected faces
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = mp_mesh.process(rgb)
+        
+        face_behaviors = {}  # {identity_name: actions_dict}
+        
+        if res.multi_face_landmarks and len(face_identities) > 0:
+            # Match each MediaPipe mesh to a detected face by proximity
+            for mp_landmarks in res.multi_face_landmarks:
+                # Get center of MediaPipe mesh
+                mp_x = int(mp_landmarks.landmark[1].x * W)
+                mp_y = int(mp_landmarks.landmark[1].y * H)
+                
+                # Find closest detected face
+                min_distance = float('inf')
+                closest_face_identity = None
+                closest_face = None
+                
+                for face, identity, dist, is_target in face_identities:
+                    face_center_x = (face.x1 + face.x2) // 2
+                    face_center_y = (face.y1 + face.y2) // 2
+                    distance = ((mp_x - face_center_x)**2 + (mp_y - face_center_y)**2)**0.5
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_face_identity = identity
+                        closest_face = face
+                
+                # Only process if mesh is close enough to a detected face (within face bounds)
+                if min_distance < 150 and closest_face_identity:
+                    # Create action detector for this identity if not exists
+                    if closest_face_identity not in action_detectors:
+                        action_detectors[closest_face_identity] = ActionDetector()
+                    
+                    # Detect actions for this face
+                    actions = action_detectors[closest_face_identity].detect(
+                        mp_landmarks.landmark,
+                        closest_face, frame_idx, W, H
+                    )
+                    face_behaviors[closest_face_identity] = actions
+                    
+                    # Log actions for the locked identity
+                    if closest_face_identity == lock_identity and actions:
+                        for action_type, action_text in actions:
+                            history_logger.log_action(action_type.upper(), action_text)
         else:
             fail_count += 1
             if fail_count >= config.LOCK_RELEASE_FRAMES:
                 if locked:
                     print("🔓 UNLOCKED")
+                    history_logger.log_lock_release()
                 locked = False
 
-        # Draw all faces with appropriate labels
+        # Draw all faces with appropriate labels and behaviors
         for face, identity, dist, is_target in face_identities:
+            x1, y1, x2, y2 = face.x1, face.y1, face.x2, face.y2
+            
             if is_target and locked:
-                # Locked target: green box with tracker smoothing and actions
+                # Locked target: green box with tracker smoothing
                 x1, y1, x2, y2 = tracked_box
                 color = (0, 255, 0)
-                label = f"🔒 {identity}"
+                label = f"🔒 {identity} (TARGET)"
                 thickness = 3
                 
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
@@ -317,14 +441,14 @@ def main():
                     color, 2
                 )
                 
-                # Draw actions only for locked target
-                action_detector.draw_actions(vis, x1, y1)
+                # Draw actions for locked target
+                if identity in face_behaviors:
+                    action_detectors[identity].draw_actions(vis, x1, y1)
                 
             elif identity == "UNKNOWN":
                 # Unknown face: red box
-                x1, y1, x2, y2 = face.x1, face.y1, face.x2, face.y2
                 color = (0, 0, 255)
-                label = "UNKNOWN"
+                label = "❓ UNKNOWN"
                 thickness = 2
                 
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
@@ -334,20 +458,54 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     color, 2
                 )
+                
+                # Show behaviors for unknown faces too (if detected)
+                if identity in face_behaviors:
+                    action_detectors[identity].draw_actions(vis, x1, y1)
             else:
-                # Other known identity: just show name, no box
-                x1, y1, x2, y2 = face.x1, face.y1, face.x2, face.y2
+                # Other known identity: blue box with behaviors
+                color = (255, 165, 0)  # Orange
+                label = f"👤 {identity}"
+                thickness = 2
+                
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
                 cv2.putText(
-                    vis, identity,
+                    vis, label,
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 165, 0), 2  # Orange text
+                    color, 2
                 )
+                
+                # Draw actions for other known faces
+                if identity in face_behaviors:
+                    action_detectors[identity].draw_actions(vis, x1, y1)
+        
+        # Display multi-person detection status
+        num_detected = len(face_identities)
+        known_count = len([f for f in face_identities if f[1] != "UNKNOWN"])
+        unknown_count = num_detected - known_count
+        
+        status_y = 30
+        cv2.putText(vis, f"👥 Detected: {num_detected} people", 
+                    (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        if num_detected > 0:
+            status_y += 30
+            cv2.putText(vis, f"✓ Known: {known_count}  ❌ Unknown: {unknown_count}", 
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        if locked:
+            status_y += 30
+            cv2.putText(vis, f"🎯 Target: {lock_identity}", 
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         cv2.imshow("Face Locking", vis)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+    # Log session end
+    history_logger.log_action("SESSION_END", "Face locking session ended")
+    
     cap.release()
     cv2.destroyAllWindows()
 

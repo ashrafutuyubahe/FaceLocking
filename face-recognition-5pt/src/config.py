@@ -107,7 +107,7 @@ ACCEPT_HOLD_FRAMES = 3  # Hold "accepted" state for N frames
 # CAMERA SETTINGS
 # ============================================================================
 
-CAMERA_INDEX = 0  # Default: first camera
+CAMERA_INDEX = 1  # Default: first camera
 CAMERA_FRAME_WIDTH = 640
 CAMERA_FRAME_HEIGHT = 480
 CAMERA_FPS_TARGET = 30
@@ -138,7 +138,7 @@ LOCK_RELEASE_FRAMES = 45
 LOCK_MOVEMENT_THRESHOLD_PX = 25
 LOCK_EAR_BLINK_THRESHOLD = 0.22
 LOCK_SMILE_MOUTH_RATIO = 1.18
-LOCK_ACTION_COOLDOWN_FRAMES = 10
+LOCK_ACTION_COOLDOWN_FRAMES = 3  # Reduced for more continuous logging
 HISTORY_DIR = DATA_DIR / "history"
 LOCK_EAR_LEFT_INDICES = (33, 160, 158, 133, 153, 144)
 LOCK_EAR_RIGHT_INDICES = (362, 385, 387, 263, 373, 380)
